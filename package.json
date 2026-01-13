@@ -4,6 +4,11 @@
   "description": "",
   "main": "dist/index.js",
   "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./stdio": "./dist/stdio.js",
+    "./http": "./dist/http.js"
+  },
   "files": [
     "dist"
   ],
@@ -21,21 +26,34 @@
   "packageManager": "pnpm@10.26.0",
   "devDependencies": {
     "@eslint/js": "^9.39.2",
+    "@hono/node-server": "^1.19.8",
+    "@modelcontextprotocol/sdk": "^1.25.2",
     "@typescript/native-preview": "7.0.0-dev.20260113.1",
     "eslint": "^9.39.2",
     "eventsource": "^4.1.0",
     "get-port": "^7.1.0",
     "globals": "^17.0.0",
+    "hono": "^4.11.4",
     "jiti": "^2.6.1",
     "prettier": "^3.7.4",
     "typescript-eslint": "^8.53.0",
-    "vitest": "^4.0.17"
+    "vitest": "^4.0.17",
+    "zod": "^4.3.5"
   },
-  "dependencies": {
+  "peerDependencies": {
     "@hono/node-server": "^1.19.8",
     "@modelcontextprotocol/sdk": "^1.25.2",
-    "hono": "^4.11.4",
-    "uuid": "^13.0.0",
-    "zod": "^4.3.5"
+    "hono": "^4.11.4"
+  },
+  "peerDependenciesMeta": {
+    "@hono/node-server": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "uuid": "^13.0.0"
   }
 }

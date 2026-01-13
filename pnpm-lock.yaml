@@ -8,25 +8,19 @@ importers:
 
   .:
     dependencies:
+      uuid:
+        specifier: ^13.0.0
+        version: 13.0.0
+    devDependencies:
+      '@eslint/js':
+        specifier: ^9.39.2
+        version: 9.39.2
       '@hono/node-server':
         specifier: ^1.19.8
         version: 1.19.8(hono@4.11.4)
       '@modelcontextprotocol/sdk':
         specifier: ^1.25.2
         version: 1.25.2(hono@4.11.4)(zod@4.3.5)
-      hono:
-        specifier: ^4.11.4
-        version: 4.11.4
-      uuid:
-        specifier: ^13.0.0
-        version: 13.0.0
-      zod:
-        specifier: ^4.3.5
-        version: 4.3.5
-    devDependencies:
-      '@eslint/js':
-        specifier: ^9.39.2
-        version: 9.39.2
       '@typescript/native-preview':
         specifier: 7.0.0-dev.20260113.1
         version: 7.0.0-dev.20260113.1
@@ -42,6 +36,9 @@ importers:
       globals:
         specifier: ^17.0.0
         version: 17.0.0
+      hono:
+        specifier: ^4.11.4
+        version: 4.11.4
       jiti:
         specifier: ^2.6.1
         version: 2.6.1
@@ -54,6 +51,9 @@ importers:
       vitest:
         specifier: ^4.0.17
         version: 4.0.17(jiti@2.6.1)
+      zod:
+        specifier: ^4.3.5
+        version: 4.3.5
 
 packages:
 
