@@ -3,6 +3,7 @@ import type { HttpBindings } from "@hono/node-server";
 import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { Hono } from "hono";
@@ -39,10 +40,10 @@ export interface HttpServerOptions {
 }
 
 /**
- * Handle returned by serveHttp for controlling the server lifecycle.
+ * Handle returned by serve functions for controlling the server lifecycle.
  */
-export interface HttpServerHandle {
-  /** Close the HTTP server and stop accepting new connections. */
+export interface ServerHandle {
+  /** Close the server and stop accepting new connections. */
   close: () => Promise<void>;
 }
 
@@ -85,7 +86,7 @@ type SessionState = StreamableHttpSessionState | SseSessionState;
 /**
  * Helper to create a closeable handle from a node server.
  */
-function createHandle(server: ServerType): HttpServerHandle {
+function createHandle(server: ServerType): ServerHandle {
   return {
     close: () =>
       new Promise<void>((resolve, reject) => {
@@ -110,7 +111,7 @@ function createHandle(server: ServerType): HttpServerHandle {
 export async function serveHttp(
   serverFactory: () => McpServer,
   options: Partial<HttpServerOptions> = {},
-): Promise<HttpServerHandle> {
+): Promise<ServerHandle> {
   const mergedOptions: HttpServerOptions = {
     ...defaultOptions,
     ...options,
@@ -129,7 +130,7 @@ export async function serveHttp(
 async function serveHttpStateless(
   serverFactory: () => McpServer,
   options: HttpServerOptions,
-): Promise<HttpServerHandle> {
+): Promise<ServerHandle> {
   // Call factory ONCE to get the single server instance
   const server = serverFactory();
 
@@ -162,7 +163,7 @@ async function serveHttpStateless(
 function serveHttpStateful(
   serverFactory: () => McpServer,
   options: HttpServerOptions,
-): HttpServerHandle {
+): ServerHandle {
   const sessions = new Map<string, SessionState>();
   const sessionIdGenerator = options.sessions?.sessionIdGenerator ?? uuidv4;
 
@@ -357,4 +358,42 @@ function addCors(app: Hono<any, any, any>): void {
       exposeHeaders: ["mcp-session-id", "mcp-protocol-version"],
     }),
   );
+}
+
+/**
+ * Serve an MCP server over stdio (stdin/stdout).
+ *
+ * @param serverFactory - Factory function that creates an McpServer instance.
+ * @returns A handle to control the server lifecycle.
+ */
+export async function serveStdio(
+  serverFactory: () => McpServer,
+): Promise<ServerHandle> {
+  const server = serverFactory();
+
+  const transport = new StdioServerTransport();
+
+  // Set up the closed promise before connecting
+  let resolveClose: () => void;
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClose = resolve;
+  });
+
+  transport.onclose = () => {
+    resolveClose();
+  };
+
+  // connect() automatically calls transport.start() for stdio
+  await server.connect(transport);
+
+  let closePromise: Promise<void> | undefined;
+
+  return {
+    close: () => {
+      if (!closePromise) {
+        closePromise = transport.close().then(() => closedPromise);
+      }
+      return closePromise;
+    },
+  };
 }

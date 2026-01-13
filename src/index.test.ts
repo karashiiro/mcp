@@ -6,7 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import getPort from "get-port";
 import { z } from "zod";
-import { serveHttp, type HttpServerHandle } from "./index.js";
+import { serveHttp, type ServerHandle } from "./index.js";
 
 /**
  * Helper to create a minimal MCP server for testing.
@@ -50,7 +50,7 @@ async function createSseClient(url: string): Promise<Client> {
 }
 
 describe("serveHttp integration tests", () => {
-  let serverHandle: HttpServerHandle | undefined;
+  let serverHandle: ServerHandle | undefined;
   let port: number;
   let baseUrl: string;
 
