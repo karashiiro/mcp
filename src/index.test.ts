@@ -1,4 +1,5 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -29,11 +30,21 @@ function createTestServer(): McpServer {
 }
 
 /**
- * Helper to create an MCP client connected to a server.
+ * Helper to create an MCP client connected to a server via Streamable HTTP.
  */
 async function createClient(url: string): Promise<Client> {
   const transport = new StreamableHTTPClientTransport(new URL(url));
   const client = new Client({ name: "test-client", version: "1.0.0" });
+  await client.connect(transport);
+  return client;
+}
+
+/**
+ * Helper to create an MCP client connected to a server via SSE.
+ */
+async function createSseClient(url: string): Promise<Client> {
+  const transport = new SSEClientTransport(new URL(url));
+  const client = new Client({ name: "test-sse-client", version: "1.0.0" });
   await client.connect(transport);
   return client;
 }
@@ -275,6 +286,129 @@ describe("serveHttp integration tests", () => {
       expect(generatorCalled).toBe(true);
 
       await client.close();
+    });
+  });
+
+  describe("legacy SSE mode", () => {
+    it("accepts SSE client connections", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          legacySse: {},
+        },
+      });
+
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const client = await createSseClient(sseUrl);
+
+      // Client connected successfully!
+      expect(client).toBeDefined();
+
+      await client.close();
+    });
+
+    it("can call tools over SSE transport", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          legacySse: {},
+        },
+      });
+
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const client = await createSseClient(sseUrl);
+
+      const result = (await client.callTool({
+        name: "echo",
+        arguments: { message: "Hello SSE!" },
+      })) as CallToolResult;
+
+      expect(result.content).toHaveLength(1);
+      expect(result.content[0]).toMatchObject({
+        type: "text",
+        text: "Echo: Hello SSE!",
+      });
+
+      await client.close();
+    });
+
+    it("uses custom SSE endpoints", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          legacySse: {
+            sseEndpoint: "/custom-sse",
+            messagesEndpoint: "/custom-messages",
+          },
+        },
+      });
+
+      const sseUrl = `http://127.0.0.1:${port}/custom-sse`;
+      const client = await createSseClient(sseUrl);
+
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+      expect(tools.tools[0]?.name).toBe("echo");
+
+      await client.close();
+    });
+
+    it("calls factory for each SSE client session", async () => {
+      const factoryCalls: number[] = [];
+      serverHandle = await serveHttp(
+        () => {
+          factoryCalls.push(Date.now());
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            legacySse: {},
+          },
+        },
+      );
+
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const client1 = await createSseClient(sseUrl);
+      const client2 = await createSseClient(sseUrl);
+
+      expect(factoryCalls.length).toBe(2); // One per SSE session!
+
+      await client1.close();
+      await client2.close();
+    });
+
+    it("supports both SSE and streamable HTTP clients simultaneously", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          legacySse: {},
+        },
+      });
+
+      // Connect SSE client
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const sseClient = await createSseClient(sseUrl);
+
+      // Connect Streamable HTTP client
+      const httpClient = await createClient(baseUrl);
+
+      // Both should work
+      const sseResult = (await sseClient.callTool({
+        name: "echo",
+        arguments: { message: "SSE" },
+      })) as CallToolResult;
+
+      const httpResult = (await httpClient.callTool({
+        name: "echo",
+        arguments: { message: "HTTP" },
+      })) as CallToolResult;
+
+      expect(sseResult.content[0]).toMatchObject({ text: "Echo: SSE" });
+      expect(httpResult.content[0]).toMatchObject({ text: "Echo: HTTP" });
+
+      await sseClient.close();
+      await httpClient.close();
     });
   });
 

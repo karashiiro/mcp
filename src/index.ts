@@ -1,5 +1,8 @@
 import { serve, type ServerType } from "@hono/node-server";
+import type { HttpBindings } from "@hono/node-server";
+import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { Hono } from "hono";
@@ -7,8 +10,25 @@ import { cors } from "hono/cors";
 import { v4 as uuidv4 } from "uuid";
 import { InMemoryEventStore } from "./event-store.js";
 
+/**
+ * Options for legacy SSE transport compatibility.
+ * @deprecated SSE transport is deprecated in favor of Streamable HTTP.
+ */
+export interface LegacySseOptions {
+  /** Endpoint for SSE stream. Defaults to "/sse". */
+  sseEndpoint?: string;
+  /** Endpoint for messages. Defaults to "/messages". */
+  messagesEndpoint?: string;
+}
+
 export interface HttpServerSessionOptions {
   sessionIdGenerator?: () => string; // defaults to uuid.v4
+  /**
+   * Enable legacy SSE transport compatibility.
+   * When provided, adds /sse and /messages endpoints for older clients.
+   * @deprecated SSE transport is deprecated in favor of Streamable HTTP.
+   */
+  legacySse?: LegacySseOptions;
 }
 
 export interface HttpServerOptions {
@@ -34,13 +54,33 @@ const defaultOptions: HttpServerOptions = Object.freeze({
 });
 
 /**
- * Session state tracking for stateful mode.
+ * Session state base interface.
  */
-interface SessionState {
-  transport: WebStandardStreamableHTTPServerTransport;
+interface SessionStateBase {
   server: McpServer;
+}
+
+/**
+ * Session state for Streamable HTTP transport.
+ */
+interface StreamableHttpSessionState extends SessionStateBase {
+  type: "streamable-http";
+  transport: WebStandardStreamableHTTPServerTransport;
   eventStore: InMemoryEventStore;
 }
+
+/**
+ * Session state for legacy SSE transport.
+ */
+interface SseSessionState extends SessionStateBase {
+  type: "sse";
+  transport: SSEServerTransport;
+}
+
+/**
+ * Discriminated union of session state types.
+ */
+type SessionState = StreamableHttpSessionState | SseSessionState;
 
 /**
  * Helper to create a closeable handle from a node server.
@@ -126,9 +166,15 @@ function serveHttpStateful(
   const sessions = new Map<string, SessionState>();
   const sessionIdGenerator = options.sessions?.sessionIdGenerator ?? uuidv4;
 
-  const app = new Hono();
+  // Legacy SSE options
+  const legacySse = options.sessions?.legacySse;
+  const sseEndpoint = legacySse?.sseEndpoint ?? "/sse";
+  const messagesEndpoint = legacySse?.messagesEndpoint ?? "/messages";
+
+  const app = new Hono<{ Bindings: HttpBindings }>();
   addCors(app);
 
+  // Main MCP endpoint (Streamable HTTP)
   app.all(options.endpoint, async (c) => {
     const sessionId = c.req.header("mcp-session-id");
 
@@ -159,7 +205,13 @@ function serveHttpStateful(
         onsessioninitialized: (sid) => {
           // Factory called per session!
           const server = serverFactory();
-          sessions.set(sid, { transport, server, eventStore });
+          const session: StreamableHttpSessionState = {
+            type: "streamable-http",
+            transport,
+            server,
+            eventStore,
+          };
+          sessions.set(sid, session);
           server.connect(transport);
         },
       });
@@ -179,12 +231,105 @@ function serveHttpStateful(
       if (!session) {
         return c.text("Session not found", 404);
       }
+      // Validate transport type matches endpoint
+      if (session.type !== "streamable-http") {
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message:
+                "Bad Request: Session exists but uses a different transport protocol",
+            },
+            id: null,
+          },
+          400,
+        );
+      }
       return session.transport.handleRequest(recreateRequest());
     }
 
     // Invalid request (no session ID, not an initialize request)
     return c.text("Bad request - missing session ID", 400);
   });
+
+  // Legacy SSE endpoints (only if enabled)
+  if (legacySse) {
+    // GET /sse - Establish SSE stream
+    app.get(sseEndpoint, async (c) => {
+      const { outgoing } = c.env;
+
+      // Create SSE transport with messages endpoint
+      const transport = new SSEServerTransport(messagesEndpoint, outgoing);
+
+      // Create and connect server
+      const server = serverFactory();
+
+      // Store session
+      const session: SseSessionState = {
+        type: "sse",
+        transport,
+        server,
+      };
+      sessions.set(transport.sessionId, session);
+
+      // Cleanup on close
+      transport.onclose = () => {
+        sessions.delete(transport.sessionId);
+      };
+
+      // Connect and start
+      await server.connect(transport);
+
+      // Signal to Hono that we've handled the response directly
+      return RESPONSE_ALREADY_SENT;
+    });
+
+    // POST /messages - Handle messages for SSE sessions
+    app.post(messagesEndpoint, async (c) => {
+      const sessionId = c.req.query("sessionId");
+
+      if (!sessionId) {
+        return c.text("Missing sessionId query parameter", 400);
+      }
+
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return c.text("Session not found", 404);
+      }
+
+      // Validate transport type matches endpoint
+      if (session.type !== "sse") {
+        return c.json(
+          {
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message:
+                "Bad Request: Session exists but uses a different transport protocol",
+            },
+            id: null,
+          },
+          400,
+        );
+      }
+
+      const { incoming, outgoing } = c.env;
+
+      // Parse body for SSEServerTransport
+      const bodyText = await c.req.text();
+      let parsedBody: unknown = null;
+      try {
+        parsedBody = bodyText ? JSON.parse(bodyText) : null;
+      } catch {
+        // Let handlePostMessage handle the error
+      }
+
+      await session.transport.handlePostMessage(incoming, outgoing, parsedBody);
+
+      return RESPONSE_ALREADY_SENT;
+    });
+  }
 
   const httpServer = serve({
     fetch: app.fetch,
@@ -195,7 +340,8 @@ function serveHttpStateful(
   return createHandle(httpServer);
 }
 
-function addCors(app: Hono): void {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function addCors(app: Hono<any, any, any>): void {
   // Enable CORS for all origins
   app.use(
     "*",

@@ -9,9 +9,11 @@
   ],
   "scripts": {
     "build": "tsgo -p tsconfig.dist.json",
-    "test": "vitest",
+    "test": "vitest --run",
     "lint": "eslint . --ext .ts",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "typecheck": "tsgo --noEmit",
+    "check": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "keywords": [],
   "author": "",
@@ -21,6 +23,7 @@
     "@eslint/js": "^9.39.2",
     "@typescript/native-preview": "7.0.0-dev.20260113.1",
     "eslint": "^9.39.2",
+    "eventsource": "^4.1.0",
     "get-port": "^7.1.0",
     "globals": "^17.0.0",
     "jiti": "^2.6.1",
