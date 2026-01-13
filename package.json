@@ -1,0 +1,37 @@
+{
+  "name": "@karashiiro/mcp",
+  "version": "0.1.0",
+  "description": "",
+  "main": "dist/index.js",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsgo -p tsconfig.dist.json",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint . --ext .ts",
+    "format": "prettier --write ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.26.0",
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@typescript/native-preview": "7.0.0-dev.20260113.1",
+    "eslint": "^9.39.2",
+    "globals": "^17.0.0",
+    "jiti": "^2.6.1",
+    "prettier": "^3.7.4",
+    "typescript-eslint": "^8.53.0",
+    "vitest": "^4.0.17"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.8",
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "hono": "^4.11.4",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.5"
+  }
+}
