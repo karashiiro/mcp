@@ -151,6 +151,49 @@ describe("serveHttp integration tests", () => {
 
       await client.close();
     });
+
+    it("factory in stateless mode receives no parameters", async () => {
+      let factoryCalled = false;
+
+      // In stateless mode, factory signature is () => McpServer (no sessionId parameter)
+      serverHandle = await serveHttp(
+        () => {
+          factoryCalled = true;
+          return createTestServer();
+        },
+        { port },
+      );
+
+      const client = await createClient(baseUrl);
+
+      expect(factoryCalled).toBe(true);
+
+      await client.close();
+    });
+
+    it("supports async factory in stateless mode", async () => {
+      let factoryCalled = false;
+
+      serverHandle = await serveHttp(
+        async () => {
+          // Simulate async initialization
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          factoryCalled = true;
+          return createTestServer();
+        },
+        { port },
+      );
+
+      expect(factoryCalled).toBe(true);
+
+      const client = await createClient(baseUrl);
+
+      // Verify the server works
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      await client.close();
+    });
   });
 
   describe("stateful mode (sessions)", () => {
@@ -287,6 +330,60 @@ describe("serveHttp integration tests", () => {
 
       await client.close();
     });
+
+    it("passes sessionId to factory in stateful mode", async () => {
+      const receivedSessionIds: (string | undefined)[] = [];
+
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          receivedSessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            sessionIdGenerator: () => "test-session-123",
+          },
+        },
+      );
+
+      const client = await createClient(baseUrl);
+
+      expect(receivedSessionIds.length).toBe(1);
+      expect(receivedSessionIds[0]).toBe("test-session-123");
+
+      await client.close();
+    });
+
+    it("supports async factory returning Promise<McpServer>", async () => {
+      const factoryCalls: string[] = [];
+
+      serverHandle = await serveHttp(
+        async (sessionId) => {
+          // Simulate async initialization
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          factoryCalls.push(sessionId ?? "undefined");
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            sessionIdGenerator: () => "async-session-456",
+          },
+        },
+      );
+
+      const client = await createClient(baseUrl);
+
+      expect(factoryCalls.length).toBe(1);
+      expect(factoryCalls[0]).toBe("async-session-456");
+
+      // Verify the server actually works
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      await client.close();
+    });
   });
 
   describe("legacy SSE mode", () => {
@@ -376,6 +473,64 @@ describe("serveHttp integration tests", () => {
 
       await client1.close();
       await client2.close();
+    });
+
+    it("passes sessionId to factory in SSE mode", async () => {
+      const receivedSessionIds: (string | undefined)[] = [];
+
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          receivedSessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            legacySse: {},
+          },
+        },
+      );
+
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const client = await createSseClient(sseUrl);
+
+      expect(receivedSessionIds.length).toBe(1);
+      // SSE transport generates its own session ID (UUID format)
+      expect(receivedSessionIds[0]).toBeDefined();
+      expect(typeof receivedSessionIds[0]).toBe("string");
+
+      await client.close();
+    });
+
+    it("supports async factory in SSE mode", async () => {
+      const factoryCalls: string[] = [];
+
+      serverHandle = await serveHttp(
+        async (sessionId) => {
+          // Simulate async initialization
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          factoryCalls.push(sessionId ?? "undefined");
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            legacySse: {},
+          },
+        },
+      );
+
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const client = await createSseClient(sseUrl);
+
+      expect(factoryCalls.length).toBe(1);
+      expect(factoryCalls[0]).not.toBe("undefined");
+
+      // Verify the server works
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      await client.close();
     });
 
     it("supports both SSE and streamable HTTP clients simultaneously", async () => {

@@ -1,19 +1,23 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { ServerHandle } from "./types.js";
+import type { ServerHandle, StatelessServerFactory } from "./types.js";
 
-export type { ServerHandle } from "./types.js";
+export type { ServerHandle, StatelessServerFactory } from "./types.js";
+
+// Re-export for backwards compatibility
+export type { ServerFactory } from "./types.js";
 
 /**
  * Serve an MCP server over stdio (stdin/stdout).
  *
  * @param serverFactory - Factory function that creates an McpServer instance.
+ *   Called once with no parameters (stdio is always single-session).
+ *   Can return a Promise for async initialization.
  * @returns A handle to control the server lifecycle.
  */
 export async function serveStdio(
-  serverFactory: () => McpServer,
+  serverFactory: StatelessServerFactory,
 ): Promise<ServerHandle> {
-  const server = serverFactory();
+  const server = await serverFactory();
 
   const transport = new StdioServerTransport();
 

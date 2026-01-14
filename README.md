@@ -96,6 +96,41 @@ const handle = await serveHttp(createServer, {
 
 In stateful mode, `createServer` is called once per client session, allowing each client to have isolated state.
 
+#### Session-Aware Factories
+
+In stateful mode, the factory function receives the session ID as a parameter, enabling session-specific initialization:
+
+```ts
+const handle = await serveHttp(
+  (sessionId) => {
+    console.log(`Creating server for session: ${sessionId}`);
+    return createServer();
+  },
+  {
+    port: 8080,
+    sessions: {},
+  },
+);
+```
+
+#### Async Factories
+
+The factory function can be async, which is useful for initialization that requires async operations:
+
+```ts
+const handle = await serveHttp(
+  async (sessionId) => {
+    // Perform async initialization (e.g., connect to database, load config)
+    await initializeResources(sessionId);
+    return createServer();
+  },
+  {
+    port: 8080,
+    sessions: {},
+  },
+);
+```
+
 #### Custom Session IDs
 
 ```ts
@@ -137,22 +172,46 @@ If you only need stdio transport, import from `@karashiiro/mcp/stdio` to avoid b
 
 ## API Reference
 
+### Factory Types
+
+The library provides two factory types for type-safe server creation:
+
+```ts
+// For stateless mode (serveStdio and serveHttp without sessions)
+type StatelessServerFactory = () => McpServer | Promise<McpServer>;
+
+// For stateful mode (serveHttp with sessions)
+type StatefulServerFactory = (sessionId: string) => McpServer | Promise<McpServer>;
+```
+
+Both factory types support async initialization by returning a `Promise<McpServer>`.
+
 ### `serveStdio(serverFactory)`
 
 Serves an MCP server over stdin/stdout.
 
-- `serverFactory: () => McpServer` - Factory function that creates the server instance
+- `serverFactory: StatelessServerFactory` - Factory function that creates a single server instance
 - Returns: `Promise<ServerHandle>`
 
-### `serveHttp(serverFactory, options?)`
+### `serveHttp(serverFactory, options?)` (stateless)
 
-Serves an MCP server over HTTP.
+Serves an MCP server over HTTP in stateless mode.
 
-- `serverFactory: () => McpServer` - Factory function that creates server instances
+- `serverFactory: StatelessServerFactory` - Factory function called once, creates a shared server
 - `options.port` - Port to listen on (default: `8080`)
 - `options.host` - Host to bind to (default: `"127.0.0.1"`)
 - `options.endpoint` - MCP endpoint path (default: `"/mcp"`)
-- `options.sessions` - Enable stateful mode with per-client sessions
+- Returns: `Promise<ServerHandle>`
+
+### `serveHttp(serverFactory, options)` (stateful)
+
+Serves an MCP server over HTTP in stateful mode with per-client sessions.
+
+- `serverFactory: StatefulServerFactory` - Factory function called per session with the session ID
+- `options.port` - Port to listen on (default: `8080`)
+- `options.host` - Host to bind to (default: `"127.0.0.1"`)
+- `options.endpoint` - MCP endpoint path (default: `"/mcp"`)
+- `options.sessions` - **Required** to enable stateful mode
 - `options.sessions.sessionIdGenerator` - Custom session ID generator function
 - `options.sessions.legacySse` - Enable legacy SSE transport endpoints
 - Returns: `Promise<ServerHandle>`

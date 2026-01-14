@@ -9,9 +9,20 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { v4 as uuidv4 } from "uuid";
 import { InMemoryEventStore } from "./event-store.js";
-import type { ServerHandle } from "./types.js";
+import type {
+  ServerHandle,
+  StatelessServerFactory,
+  StatefulServerFactory,
+} from "./types.js";
 
-export type { ServerHandle } from "./types.js";
+export type {
+  ServerHandle,
+  StatelessServerFactory,
+  StatefulServerFactory,
+} from "./types.js";
+
+// Re-export for backwards compatibility
+export type { ServerFactory } from "./types.js";
 
 /**
  * Options for legacy SSE transport compatibility.
@@ -34,12 +45,35 @@ export interface HttpServerSessionOptions {
   legacySse?: LegacySseOptions;
 }
 
-export interface HttpServerOptions {
+/**
+ * Base HTTP server options without session configuration.
+ */
+export interface HttpServerOptionsBase {
   port: number;
   host: string;
   endpoint: string;
-  sessions?: HttpServerSessionOptions | undefined;
 }
+
+/**
+ * HTTP server options for stateless mode (no sessions).
+ */
+export interface HttpServerStatelessOptions extends HttpServerOptionsBase {
+  sessions?: undefined;
+}
+
+/**
+ * HTTP server options for stateful mode (with sessions).
+ */
+export interface HttpServerStatefulOptions extends HttpServerOptionsBase {
+  sessions: HttpServerSessionOptions;
+}
+
+/**
+ * Combined HTTP server options type.
+ */
+export type HttpServerOptions =
+  | HttpServerStatelessOptions
+  | HttpServerStatefulOptions;
 
 const defaultOptions: HttpServerOptions = Object.freeze({
   port: 8080,
@@ -93,17 +127,42 @@ function createHandle(server: ServerType): ServerHandle {
 }
 
 /**
- * Serve an MCP server over HTTP.
+ * Serve an MCP server over HTTP in stateless mode.
  *
- * @param serverFactory - Factory function that creates McpServer instances.
- *   In stateless mode, called once. In stateful mode, called per session.
- * @param options - Server configuration options.
- *   If `sessions` is provided, runs in stateful mode with per-session servers.
- *   If `sessions` is undefined, runs in stateless mode with a single server.
+ * In stateless mode, the factory is called once and all clients share the same server instance.
+ * The factory receives no parameters.
+ *
+ * @param serverFactory - Factory function that creates a single shared McpServer instance.
+ * @param options - Server configuration options (without sessions).
  * @returns A handle to control the server lifecycle.
  */
+export function serveHttp(
+  serverFactory: StatelessServerFactory,
+  options?: Partial<Omit<HttpServerOptionsBase, "sessions">> & {
+    sessions?: undefined;
+  },
+): Promise<ServerHandle>;
+
+/**
+ * Serve an MCP server over HTTP in stateful mode with per-client sessions.
+ *
+ * In stateful mode, the factory is called once per client session, receiving the session ID.
+ * This allows each client to have isolated state.
+ *
+ * @param serverFactory - Factory function that creates McpServer instances per session.
+ * @param options - Server configuration options with sessions enabled.
+ * @returns A handle to control the server lifecycle.
+ */
+export function serveHttp(
+  serverFactory: StatefulServerFactory,
+  options: Partial<HttpServerOptionsBase> & {
+    sessions: HttpServerSessionOptions;
+  },
+): Promise<ServerHandle>;
+
+// Implementation signature (accepts both)
 export async function serveHttp(
-  serverFactory: () => McpServer,
+  serverFactory: StatelessServerFactory | StatefulServerFactory,
   options: Partial<HttpServerOptions> = {},
 ): Promise<ServerHandle> {
   const mergedOptions: HttpServerOptions = {
@@ -112,9 +171,15 @@ export async function serveHttp(
   };
 
   if (mergedOptions.sessions) {
-    return serveHttpStateful(serverFactory, mergedOptions);
+    return serveHttpStateful(
+      serverFactory as StatefulServerFactory,
+      mergedOptions as HttpServerStatefulOptions,
+    );
   } else {
-    return serveHttpStateless(serverFactory, mergedOptions);
+    return serveHttpStateless(
+      serverFactory as StatelessServerFactory,
+      mergedOptions as HttpServerStatelessOptions,
+    );
   }
 }
 
@@ -122,11 +187,11 @@ export async function serveHttp(
  * Stateless mode: single server instance, single transport, no session tracking.
  */
 async function serveHttpStateless(
-  serverFactory: () => McpServer,
-  options: HttpServerOptions,
+  serverFactory: StatelessServerFactory,
+  options: HttpServerStatelessOptions,
 ): Promise<ServerHandle> {
-  // Call factory ONCE to get the single server instance
-  const server = serverFactory();
+  // Call factory ONCE to get the single server instance (no sessionId in stateless mode)
+  const server = await serverFactory();
 
   // Create the transport (no session ID generator = stateless)
   const transport = new WebStandardStreamableHTTPServerTransport({
@@ -134,7 +199,7 @@ async function serveHttpStateless(
   });
 
   // Create the Hono app
-  const app = new Hono();
+  const app = new Hono<{ Bindings: HttpBindings }>();
   addCors(app);
 
   // MCP endpoint
@@ -155,11 +220,11 @@ async function serveHttpStateless(
  * Stateful mode: per-session servers, transports, and event stores.
  */
 function serveHttpStateful(
-  serverFactory: () => McpServer,
-  options: HttpServerOptions,
+  serverFactory: StatefulServerFactory,
+  options: HttpServerStatefulOptions,
 ): ServerHandle {
   const sessions = new Map<string, SessionState>();
-  const sessionIdGenerator = options.sessions?.sessionIdGenerator ?? uuidv4;
+  const sessionIdGenerator = options.sessions.sessionIdGenerator ?? uuidv4;
 
   // Legacy SSE options
   const legacySse = options.sessions?.legacySse;
@@ -193,13 +258,19 @@ function serveHttpStateful(
 
     // New session (initialize request without session ID)
     if (!sessionId && body && isInitializeRequest(body)) {
+      // Generate session ID upfront so we can pass it to the factory
+      const sid = sessionIdGenerator();
+
+      // Create server with session ID (supports async factories)
+      const server = await serverFactory(sid);
+
       const eventStore = new InMemoryEventStore();
       const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator,
+        // Use our pre-generated session ID
+        sessionIdGenerator: () => sid,
         eventStore,
-        onsessioninitialized: (sid) => {
-          // Factory called per session!
-          const server = serverFactory();
+        onsessioninitialized: () => {
+          // Server already created above, just store the session state
           const session: StreamableHttpSessionState = {
             type: "streamable-http",
             transport,
@@ -207,14 +278,14 @@ function serveHttpStateful(
             eventStore,
           };
           sessions.set(sid, session);
-          server.connect(transport);
         },
       });
 
+      // Connect server to transport before handling the request
+      await server.connect(transport);
+
       transport.onclose = () => {
-        if (transport.sessionId) {
-          sessions.delete(transport.sessionId);
-        }
+        sessions.delete(sid);
       };
 
       return transport.handleRequest(recreateRequest());
@@ -257,8 +328,8 @@ function serveHttpStateful(
       // Create SSE transport with messages endpoint
       const transport = new SSEServerTransport(messagesEndpoint, outgoing);
 
-      // Create and connect server
-      const server = serverFactory();
+      // Create server with session ID (supports async factories)
+      const server = await serverFactory(transport.sessionId);
 
       // Store session
       const session: SseSessionState = {
@@ -335,8 +406,7 @@ function serveHttpStateful(
   return createHandle(httpServer);
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function addCors(app: Hono<any, any, any>): void {
+function addCors(app: Hono<{ Bindings: HttpBindings }>): void {
   // Enable CORS for all origins
   app.use(
     "*",
