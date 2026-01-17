@@ -238,6 +238,21 @@ function serveHttpStateful(
   app.all(options.endpoint, async (c) => {
     const sessionId = c.req.header("mcp-session-id");
 
+    // Handle DELETE method for session termination
+    if (c.req.method === "DELETE") {
+      if (!sessionId) {
+        return c.text("Session ID required for DELETE", 400);
+      }
+      const session = sessions.get(sessionId);
+      if (!session) {
+        return c.text("Session not found", 404);
+      }
+      // Close the transport and clean up
+      await session.transport.close();
+      sessions.delete(sessionId);
+      return c.body(null, 204);
+    }
+
     // Clone the request so we can read the body without consuming it
     const rawRequest = c.req.raw;
     const bodyText = await rawRequest.text();

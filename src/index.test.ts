@@ -584,4 +584,122 @@ describe("serveHttp integration tests", () => {
       await expect(createClient(baseUrl)).rejects.toThrow();
     });
   });
+
+  describe("DELETE session termination", () => {
+    it("returns 204 when deleting a valid session", async () => {
+      const sessionIds: string[] = [];
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          sessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {},
+        },
+      );
+
+      // Create a session by connecting a client
+      const client = await createClient(baseUrl);
+      expect(sessionIds.length).toBe(1);
+      const sessionId = sessionIds[0];
+
+      // Send DELETE request with session ID
+      const response = await fetch(baseUrl, {
+        method: "DELETE",
+        headers: {
+          "mcp-session-id": sessionId!,
+        },
+      });
+
+      expect(response.status).toBe(204);
+
+      // Note: client.close() may fail since session is already deleted, that's OK
+      try {
+        await client.close();
+      } catch {
+        // Expected - session was deleted server-side
+      }
+    });
+
+    it("returns 404 when deleting a non-existent session", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {},
+      });
+
+      // Send DELETE with fake session ID
+      const response = await fetch(baseUrl, {
+        method: "DELETE",
+        headers: {
+          "mcp-session-id": "non-existent-session-id-12345",
+        },
+      });
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe("Session not found");
+    });
+
+    it("returns 400 when DELETE has no session ID", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {},
+      });
+
+      // Send DELETE without session ID header
+      const response = await fetch(baseUrl, {
+        method: "DELETE",
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("Session ID required for DELETE");
+    });
+
+    it("subsequent requests to deleted session fail with 404", async () => {
+      const sessionIds: string[] = [];
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          sessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {},
+        },
+      );
+
+      // Create a session
+      const client = await createClient(baseUrl);
+      const sessionId = sessionIds[0]!;
+
+      // Verify session works
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      // Delete the session
+      const deleteResponse = await fetch(baseUrl, {
+        method: "DELETE",
+        headers: {
+          "mcp-session-id": sessionId,
+        },
+      });
+      expect(deleteResponse.status).toBe(204);
+
+      // Try to use the deleted session - should get 404
+      const postResponse = await fetch(baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "mcp-session-id": sessionId,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "tools/list",
+          id: 1,
+        }),
+      });
+
+      expect(postResponse.status).toBe(404);
+    });
+  });
 });
