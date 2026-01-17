@@ -2,6 +2,18 @@ import type { EventStore } from "@modelcontextprotocol/sdk/server/webStandardStr
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 
 /**
+ * Options for configuring the in-memory event store.
+ */
+export interface InMemoryEventStoreOptions {
+  /**
+   * Maximum number of events to store per stream.
+   * When exceeded, oldest events are evicted (FIFO).
+   * Defaults to undefined (no limit).
+   */
+  maxEventsPerStream?: number;
+}
+
+/**
  * In-memory event store for SSE resumability.
  * Stores events in memory and allows replaying them from a specific point.
  * Note: Events are lost on restart.
@@ -11,11 +23,55 @@ export class InMemoryEventStore implements EventStore {
     string,
     { streamId: string; message: JSONRPCMessage }
   >();
+  private readonly maxEventsPerStream: number | undefined;
+
+  constructor(options: InMemoryEventStoreOptions = {}) {
+    this.maxEventsPerStream = options.maxEventsPerStream;
+  }
 
   async storeEvent(streamId: string, message: JSONRPCMessage): Promise<string> {
     const eventId = `${streamId}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     this.events.set(eventId, { streamId, message });
+
+    // Evict oldest events if limit exceeded
+    if (this.maxEventsPerStream !== undefined) {
+      this.evictOldestIfNeeded(streamId);
+    }
+
     return eventId;
+  }
+
+  /**
+   * Evict oldest events for a stream if it exceeds maxEventsPerStream.
+   */
+  private evictOldestIfNeeded(streamId: string): void {
+    if (this.maxEventsPerStream === undefined) return;
+
+    // Get all events for this stream, sorted by ID (contains timestamp)
+    const streamEvents = Array.from(this.events.entries())
+      .filter(([, event]) => event.streamId === streamId)
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    // Remove oldest events until we're under the limit
+    while (streamEvents.length > this.maxEventsPerStream) {
+      const [oldestId] = streamEvents.shift()!;
+      this.events.delete(oldestId);
+    }
+  }
+
+  /**
+   * Clear all events from the store.
+   * Call this when the session is being deleted.
+   */
+  clear(): void {
+    this.events.clear();
+  }
+
+  /**
+   * Get the current number of events stored.
+   */
+  get size(): number {
+    return this.events.size;
   }
 
   async replayEventsAfter(

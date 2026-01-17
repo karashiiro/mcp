@@ -38,6 +38,17 @@ export interface LegacySseOptions {
 export interface HttpServerSessionOptions {
   sessionIdGenerator?: () => string; // defaults to uuid.v4
   /**
+   * Session time-to-live in milliseconds. Sessions without activity for this
+   * duration will be automatically cleaned up. Defaults to 30 minutes.
+   * Set to 0 or undefined to disable automatic cleanup.
+   */
+  sessionTtlMs?: number;
+  /**
+   * Interval in milliseconds for checking expired sessions.
+   * Defaults to 60000 (1 minute). Only used if sessionTtlMs is set.
+   */
+  cleanupIntervalMs?: number;
+  /**
    * Enable legacy SSE transport compatibility.
    * When provided, adds /sse and /messages endpoints for older clients.
    * @deprecated SSE transport is deprecated in favor of Streamable HTTP.
@@ -87,6 +98,10 @@ const defaultOptions: HttpServerOptions = Object.freeze({
  */
 interface SessionStateBase {
   server: McpServer;
+  /** Timestamp of last activity (Date.now()) for TTL tracking */
+  lastActivity: number;
+  /** Number of active streaming connections (e.g., SSE streams) */
+  activeStreams: number;
 }
 
 /**
@@ -226,6 +241,35 @@ function serveHttpStateful(
   const sessions = new Map<string, SessionState>();
   const sessionIdGenerator = options.sessions.sessionIdGenerator ?? uuidv4;
 
+  // Session TTL configuration
+  const sessionTtlMs = options.sessions.sessionTtlMs;
+  const cleanupIntervalMs = options.sessions.cleanupIntervalMs ?? 60000; // Default 1 minute
+
+  // Set up periodic cleanup for expired sessions
+  let cleanupInterval: ReturnType<typeof setInterval> | undefined;
+  if (sessionTtlMs && sessionTtlMs > 0) {
+    cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [sessionId, session] of sessions) {
+        // Skip sessions with active streaming connections
+        if (session.activeStreams > 0) {
+          continue;
+        }
+        if (now - session.lastActivity > sessionTtlMs) {
+          // Session expired - close transport and remove
+          session.transport.close().catch(() => {
+            // Ignore close errors for expired sessions
+          });
+          // Clear event store if this is a streamable HTTP session
+          if (session.type === "streamable-http") {
+            session.eventStore.clear();
+          }
+          sessions.delete(sessionId);
+        }
+      }
+    }, cleanupIntervalMs);
+  }
+
   // Legacy SSE options
   const legacySse = options.sessions?.legacySse;
   const sseEndpoint = legacySse?.sseEndpoint ?? "/sse";
@@ -249,6 +293,10 @@ function serveHttpStateful(
       }
       // Close the transport and clean up
       await session.transport.close();
+      // Clear event store if this is a streamable HTTP session
+      if (session.type === "streamable-http") {
+        session.eventStore.clear();
+      }
       sessions.delete(sessionId);
       return c.body(null, 204);
     }
@@ -291,6 +339,8 @@ function serveHttpStateful(
             transport,
             server,
             eventStore,
+            lastActivity: Date.now(),
+            activeStreams: 0,
           };
           sessions.set(sid, session);
         },
@@ -300,6 +350,7 @@ function serveHttpStateful(
       await server.connect(transport);
 
       transport.onclose = () => {
+        eventStore.clear();
         sessions.delete(sid);
       };
 
@@ -327,6 +378,8 @@ function serveHttpStateful(
           400,
         );
       }
+      // Update last activity for TTL tracking
+      session.lastActivity = Date.now();
       return session.transport.handleRequest(recreateRequest());
     }
 
@@ -346,16 +399,19 @@ function serveHttpStateful(
       // Create server with session ID (supports async factories)
       const server = await serverFactory(transport.sessionId);
 
-      // Store session
+      // Store session - SSE connection counts as an active stream
       const session: SseSessionState = {
         type: "sse",
         transport,
         server,
+        lastActivity: Date.now(),
+        activeStreams: 1, // SSE connection is an active stream
       };
       sessions.set(transport.sessionId, session);
 
-      // Cleanup on close
+      // Cleanup on close - SSE stream is no longer active
       transport.onclose = () => {
+        session.activeStreams = 0;
         sessions.delete(transport.sessionId);
       };
 
@@ -397,6 +453,9 @@ function serveHttpStateful(
 
       const { incoming, outgoing } = c.env;
 
+      // Update last activity for TTL tracking
+      session.lastActivity = Date.now();
+
       // Parse body for SSEServerTransport
       const bodyText = await c.req.text();
       let parsedBody: unknown = null;
@@ -418,7 +477,27 @@ function serveHttpStateful(
     hostname: options.host,
   });
 
-  return createHandle(httpServer);
+  // Create handle that also clears the cleanup interval
+  const baseHandle = createHandle(httpServer);
+  return {
+    close: async () => {
+      if (cleanupInterval) {
+        clearInterval(cleanupInterval);
+      }
+      // Close all active sessions and clear their event stores
+      for (const [, session] of sessions) {
+        await session.transport.close().catch(() => {
+          // Ignore close errors during shutdown
+        });
+        // Clear event store if this is a streamable HTTP session
+        if (session.type === "streamable-http") {
+          session.eventStore.clear();
+        }
+      }
+      sessions.clear();
+      await baseHandle.close();
+    },
+  };
 }
 
 function addCors(app: Hono<{ Bindings: HttpBindings }>): void {

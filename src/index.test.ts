@@ -583,6 +583,142 @@ describe("serveHttp integration tests", () => {
       // Server should reject new connections after close
       await expect(createClient(baseUrl)).rejects.toThrow();
     });
+
+    it("cleans up all sessions on close", async () => {
+      const sessionIds: string[] = [];
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          sessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            sessionTtlMs: 60000, // Long TTL so sessions don't expire
+          },
+        },
+      );
+
+      // Create multiple sessions
+      const client1 = await createClient(baseUrl);
+      const client2 = await createClient(baseUrl);
+      expect(sessionIds.length).toBe(2);
+
+      // Verify sessions work
+      await client1.listTools();
+      await client2.listTools();
+
+      // Close the server - this should clean up all sessions
+      await serverHandle.close();
+      serverHandle = undefined;
+
+      // Server should be down, can't create new connections
+      await expect(createClient(baseUrl)).rejects.toThrow();
+    });
+  });
+
+  describe("session TTL", () => {
+    it("expires sessions after TTL with no activity", async () => {
+      const sessionIds: string[] = [];
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          sessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            sessionTtlMs: 100, // 100ms TTL
+            cleanupIntervalMs: 50, // Check every 50ms
+          },
+        },
+      );
+
+      // Create a session
+      const client = await createClient(baseUrl);
+      const sessionId = sessionIds[0]!;
+
+      // Verify session works
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      // Wait for TTL + cleanup interval to pass
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // Session should be expired - subsequent request should fail
+      const response = await fetch(baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "mcp-session-id": sessionId,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "tools/list",
+          id: 1,
+        }),
+      });
+
+      expect(response.status).toBe(404);
+    });
+
+    it("keeps sessions alive with activity", async () => {
+      const sessionIds: string[] = [];
+      serverHandle = await serveHttp(
+        (sessionId) => {
+          sessionIds.push(sessionId);
+          return createTestServer();
+        },
+        {
+          port,
+          sessions: {
+            sessionTtlMs: 150, // 150ms TTL
+            cleanupIntervalMs: 50, // Check every 50ms
+          },
+        },
+      );
+
+      // Create a session
+      const client = await createClient(baseUrl);
+
+      // Keep session alive by making requests every 100ms (before TTL expires)
+      for (let i = 0; i < 3; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const tools = await client.listTools();
+        expect(tools.tools).toHaveLength(1);
+      }
+
+      // Session should still be alive after 300ms total (3 x 100ms)
+      // because each request refreshed the TTL
+      const tools = await client.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      await client.close();
+    });
+
+    it("does not expire SSE sessions with active connections", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          sessionTtlMs: 100, // Very short TTL
+          cleanupIntervalMs: 50,
+          legacySse: {},
+        },
+      });
+
+      // Connect SSE client (this creates an active stream)
+      const sseUrl = `http://127.0.0.1:${port}/sse`;
+      const sseClient = await createSseClient(sseUrl);
+
+      // Wait longer than TTL
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // SSE session should still be alive because it has an active stream
+      const tools = await sseClient.listTools();
+      expect(tools.tools).toHaveLength(1);
+
+      await sseClient.close();
+    });
   });
 
   describe("DELETE session termination", () => {
