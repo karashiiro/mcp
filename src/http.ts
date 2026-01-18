@@ -49,6 +49,17 @@ export interface HttpServerSessionOptions {
    */
   cleanupIntervalMs?: number;
   /**
+   * Callback invoked when a session is closed.
+   * Called for all cleanup paths: TTL expiration, DELETE requests, transport close, and server shutdown.
+   * Useful for cleaning up session-scoped resources like database connections or client state.
+   *
+   * Note: In TTL cleanup, the callback is invoked but not awaited to avoid blocking the cleanup interval.
+   * In all other paths (DELETE, transport close, shutdown), async callbacks are awaited.
+   *
+   * @param sessionId - The ID of the session being closed
+   */
+  onSessionClosed?: (sessionId: string) => void | Promise<void>;
+  /**
    * Enable legacy SSE transport compatibility.
    * When provided, adds /sse and /messages endpoints for older clients.
    * @deprecated SSE transport is deprecated in favor of Streamable HTTP.
@@ -240,6 +251,34 @@ function serveHttpStateful(
 ): ServerHandle {
   const sessions = new Map<string, SessionState>();
   const sessionIdGenerator = options.sessions.sessionIdGenerator ?? uuidv4;
+  const onSessionClosed = options.sessions.onSessionClosed;
+
+  // Helper to safely invoke onSessionClosed callback
+  // Catches errors to prevent user code from breaking cleanup
+  const notifySessionClosed = (sessionId: string): void => {
+    if (onSessionClosed) {
+      try {
+        // Fire and forget - don't await to avoid blocking
+        // Errors are caught and ignored to prevent breaking cleanup
+        Promise.resolve(onSessionClosed(sessionId)).catch(() => {
+          // Ignore errors from user callback
+        });
+      } catch {
+        // Ignore synchronous errors from user callback
+      }
+    }
+  };
+
+  // Async version for paths where we can await
+  const notifySessionClosedAsync = async (sessionId: string): Promise<void> => {
+    if (onSessionClosed) {
+      try {
+        await onSessionClosed(sessionId);
+      } catch {
+        // Ignore errors from user callback
+      }
+    }
+  };
 
   // Session TTL configuration
   const sessionTtlMs = options.sessions.sessionTtlMs;
@@ -265,6 +304,8 @@ function serveHttpStateful(
             session.eventStore.clear();
           }
           sessions.delete(sessionId);
+          // Notify callback (fire and forget to avoid blocking interval)
+          notifySessionClosed(sessionId);
         }
       }
     }, cleanupIntervalMs);
@@ -298,6 +339,8 @@ function serveHttpStateful(
         session.eventStore.clear();
       }
       sessions.delete(sessionId);
+      // Notify callback (awaited since we're in async context)
+      await notifySessionClosedAsync(sessionId);
       return c.body(null, 204);
     }
 
@@ -352,6 +395,8 @@ function serveHttpStateful(
       transport.onclose = () => {
         eventStore.clear();
         sessions.delete(sid);
+        // Notify callback (fire and forget since onclose is sync)
+        notifySessionClosed(sid);
       };
 
       return transport.handleRequest(recreateRequest());
@@ -413,6 +458,8 @@ function serveHttpStateful(
       transport.onclose = () => {
         session.activeStreams = 0;
         sessions.delete(transport.sessionId);
+        // Notify callback (fire and forget since onclose is sync)
+        notifySessionClosed(transport.sessionId);
       };
 
       // Connect and start
@@ -485,7 +532,7 @@ function serveHttpStateful(
         clearInterval(cleanupInterval);
       }
       // Close all active sessions and clear their event stores
-      for (const [, session] of sessions) {
+      for (const [sessionId, session] of sessions) {
         await session.transport.close().catch(() => {
           // Ignore close errors during shutdown
         });
@@ -493,6 +540,8 @@ function serveHttpStateful(
         if (session.type === "streamable-http") {
           session.eventStore.clear();
         }
+        // Notify callback (awaited since we're in async shutdown)
+        await notifySessionClosedAsync(sessionId);
       }
       sessions.clear();
       await baseHandle.close();

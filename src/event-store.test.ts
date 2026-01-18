@@ -52,12 +52,18 @@ describe("InMemoryEventStore", () => {
 
       // Store 3 events in stream1
       for (let i = 1; i <= 3; i++) {
-        await store.storeEvent("stream1", { jsonrpc: "2.0", method: `s1-${i}` });
+        await store.storeEvent("stream1", {
+          jsonrpc: "2.0",
+          method: `s1-${i}`,
+        });
       }
 
       // Store 3 events in stream2
       for (let i = 1; i <= 3; i++) {
-        await store.storeEvent("stream2", { jsonrpc: "2.0", method: `s2-${i}` });
+        await store.storeEvent("stream2", {
+          jsonrpc: "2.0",
+          method: `s2-${i}`,
+        });
       }
 
       // Each stream should have max 2 events = 4 total
@@ -69,7 +75,10 @@ describe("InMemoryEventStore", () => {
 
       // Store many events
       for (let i = 1; i <= 100; i++) {
-        await store.storeEvent("stream1", { jsonrpc: "2.0", method: `test${i}` });
+        await store.storeEvent("stream1", {
+          jsonrpc: "2.0",
+          method: `test${i}`,
+        });
       }
 
       // All events should be stored

@@ -32,13 +32,9 @@ function createServer() {
     version: "1.0.0",
   });
 
-  server.registerTool(
-    "hello",
-    { description: "Says hello" },
-    async () => ({
-      content: [{ type: "text", text: "Hello from MCP!" }],
-    }),
-  );
+  server.registerTool("hello", { description: "Says hello" }, async () => ({
+    content: [{ type: "text", text: "Hello from MCP!" }],
+  }));
 
   return server;
 }
@@ -60,13 +56,9 @@ function createServer() {
     version: "1.0.0",
   });
 
-  server.registerTool(
-    "hello",
-    { description: "Says hello" },
-    async () => ({
-      content: [{ type: "text", text: "Hello from MCP!" }],
-    }),
-  );
+  server.registerTool("hello", { description: "Says hello" }, async () => ({
+    content: [{ type: "text", text: "Hello from MCP!" }],
+  }));
 
   return server;
 }
@@ -151,7 +143,7 @@ const handle = await serveHttp(createServer, {
   port: 8080,
   sessions: {
     legacySse: {
-      sseEndpoint: "/sse",        // default: "/sse"
+      sseEndpoint: "/sse", // default: "/sse"
       messagesEndpoint: "/messages", // default: "/messages"
     },
   },
@@ -162,11 +154,11 @@ const handle = await serveHttp(createServer, {
 
 This package provides multiple entry points for optimal bundle size:
 
-| Entry Point | Description | Requires Hono |
-|-------------|-------------|---------------|
-| `@karashiiro/mcp` | Everything (re-exports all) | Yes |
-| `@karashiiro/mcp/stdio` | Stdio transport only | No |
-| `@karashiiro/mcp/http` | HTTP transport only | Yes |
+| Entry Point             | Description                 | Requires Hono |
+| ----------------------- | --------------------------- | ------------- |
+| `@karashiiro/mcp`       | Everything (re-exports all) | Yes           |
+| `@karashiiro/mcp/stdio` | Stdio transport only        | No            |
+| `@karashiiro/mcp/http`  | HTTP transport only         | Yes           |
 
 If you only need stdio transport, import from `@karashiiro/mcp/stdio` to avoid bundling Hono.
 
@@ -181,7 +173,9 @@ The library provides two factory types for type-safe server creation:
 type StatelessServerFactory = () => McpServer | Promise<McpServer>;
 
 // For stateful mode (serveHttp with sessions)
-type StatefulServerFactory = (sessionId: string) => McpServer | Promise<McpServer>;
+type StatefulServerFactory = (
+  sessionId: string,
+) => McpServer | Promise<McpServer>;
 ```
 
 Both factory types support async initialization by returning a `Promise<McpServer>`.
