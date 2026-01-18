@@ -259,12 +259,19 @@ function serveHttpStateful(
     if (onSessionClosed) {
       try {
         // Fire and forget - don't await to avoid blocking
-        // Errors are caught and ignored to prevent breaking cleanup
-        Promise.resolve(onSessionClosed(sessionId)).catch(() => {
-          // Ignore errors from user callback
+        // Errors are logged but not propagated to prevent breaking cleanup
+        Promise.resolve(onSessionClosed(sessionId)).catch((error) => {
+          console.error(
+            `[MCP] onSessionClosed callback error for session ${sessionId}:`,
+            error,
+          );
         });
-      } catch {
-        // Ignore synchronous errors from user callback
+      } catch (error) {
+        // Log synchronous errors from user callback
+        console.error(
+          `[MCP] onSessionClosed callback sync error for session ${sessionId}:`,
+          error,
+        );
       }
     }
   };
@@ -274,8 +281,12 @@ function serveHttpStateful(
     if (onSessionClosed) {
       try {
         await onSessionClosed(sessionId);
-      } catch {
-        // Ignore errors from user callback
+      } catch (error) {
+        // Log but don't propagate to prevent breaking cleanup
+        console.error(
+          `[MCP] onSessionClosed callback error for session ${sessionId}:`,
+          error,
+        );
       }
     }
   };
