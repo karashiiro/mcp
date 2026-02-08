@@ -155,10 +155,11 @@ function createHandle(server: ServerType): ServerHandle {
 /**
  * Serve an MCP server over HTTP in stateless mode.
  *
- * In stateless mode, the factory is called once and all clients share the same server instance.
- * The factory receives no parameters.
+ * In stateless mode, the factory is called for each incoming request to create
+ * a fresh McpServer instance per request, since McpServer can only be attached
+ * to one client at a time. The factory receives no parameters.
  *
- * @param serverFactory - Factory function that creates a single shared McpServer instance.
+ * @param serverFactory - Factory function that creates McpServer instances (called per request).
  * @param options - Server configuration options (without sessions).
  * @returns A handle to control the server lifecycle.
  */
@@ -210,28 +211,28 @@ export async function serveHttp(
 }
 
 /**
- * Stateless mode: single server instance, single transport, no session tracking.
+ * Stateless mode: new server instance per request, no session tracking.
+ *
+ * McpServer instances can only be attached to one client at a time, so we
+ * create a fresh server and transport for every incoming HTTP request.
  */
 async function serveHttpStateless(
   serverFactory: StatelessServerFactory,
   options: HttpServerStatelessOptions,
 ): Promise<ServerHandle> {
-  // Call factory ONCE to get the single server instance (no sessionId in stateless mode)
-  const server = await serverFactory();
-
-  // Create the transport (no session ID generator = stateless)
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,
-  });
-
   // Create the Hono app
   const app = new Hono<{ Bindings: HttpBindings }>();
   addCors(app);
 
-  // MCP endpoint
-  app.all(options.endpoint, (c) => transport.handleRequest(c.req.raw));
-
-  await server.connect(transport);
+  // MCP endpoint — each request gets its own server + transport
+  app.all(options.endpoint, async (c) => {
+    const server = await serverFactory();
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+    });
+    await server.connect(transport);
+    return transport.handleRequest(c.req.raw);
+  });
 
   const httpServer = serve({
     fetch: app.fetch,
