@@ -68,25 +68,17 @@ describe("serveHttp integration tests", () => {
 
   describe("stateless mode", () => {
     it("accepts client connections and responds to initialize", async () => {
-      const factoryCalls: number[] = [];
-      serverHandle = await serveHttp(
-        () => {
-          factoryCalls.push(Date.now());
-          return createTestServer();
-        },
-        { port },
-      );
+      serverHandle = await serveHttp(createTestServer, { port });
 
       const client = await createClient(baseUrl);
 
       // Client connected successfully!
       expect(client).toBeDefined();
-      expect(factoryCalls.length).toBe(1); // Factory called once
 
       await client.close();
     });
 
-    it("calls factory only once for multiple client connections", async () => {
+    it("calls factory for each request so servers are not reused", async () => {
       const factoryCalls: number[] = [];
       serverHandle = await serveHttp(
         () => {
@@ -96,11 +88,12 @@ describe("serveHttp integration tests", () => {
         { port },
       );
 
-      // Connect multiple clients
+      // Connect multiple clients — each connection triggers at least one request
       const client1 = await createClient(baseUrl);
       const client2 = await createClient(baseUrl);
 
-      expect(factoryCalls.length).toBe(1); // Still only 1!
+      // Factory must be called more than once since each request gets its own server
+      expect(factoryCalls.length).toBeGreaterThan(1);
 
       await client1.close();
       await client2.close();
@@ -172,21 +165,25 @@ describe("serveHttp integration tests", () => {
     });
 
     it("supports async factory in stateless mode", async () => {
-      let factoryCalled = false;
+      let factoryCallCount = 0;
 
       serverHandle = await serveHttp(
         async () => {
           // Simulate async initialization
           await new Promise((resolve) => setTimeout(resolve, 10));
-          factoryCalled = true;
+          factoryCallCount++;
           return createTestServer();
         },
         { port },
       );
 
-      expect(factoryCalled).toBe(true);
+      // Factory is not called at startup — it's called per request
+      expect(factoryCallCount).toBe(0);
 
       const client = await createClient(baseUrl);
+
+      // After connecting, factory should have been called at least once
+      expect(factoryCallCount).toBeGreaterThanOrEqual(1);
 
       // Verify the server works
       const tools = await client.listTools();
