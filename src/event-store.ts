@@ -1,5 +1,5 @@
-import type { EventStore } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import type { EventStore } from "./types.js";
 
 /**
  * Options for configuring the in-memory event store.
@@ -23,6 +23,7 @@ export class InMemoryEventStore implements EventStore {
     string,
     { streamId: string; message: JSONRPCMessage }
   >();
+  private initializeRequests = new Map<string, JSONRPCMessage>();
   private readonly maxEventsPerStream: number | undefined;
 
   constructor(options: InMemoryEventStoreOptions = {}) {
@@ -65,6 +66,34 @@ export class InMemoryEventStore implements EventStore {
    */
   clear(): void {
     this.events.clear();
+    this.initializeRequests.clear();
+  }
+
+  /**
+   * Check if the event store has data for the given session.
+   * @param sessionId - The ID of the session to check
+   * @returns true if an initialize request exists for the session
+   */
+  async hasSession(sessionId: string): Promise<boolean> {
+    return this.initializeRequests.has(sessionId);
+  }
+
+  /**
+   * Store the initialization request for session restoration.
+   * @param sessionId - The ID of the session
+   * @param request - The initialize request message to store
+   */
+  async storeInitializeRequest(sessionId: string, request: JSONRPCMessage): Promise<void> {
+    this.initializeRequests.set(sessionId, request);
+  }
+
+  /**
+   * Retrieve the stored initialization request.
+   * @param sessionId - The ID of the session
+   * @returns The stored initialize request, or undefined if not found
+   */
+  async getInitializeRequest(sessionId: string): Promise<JSONRPCMessage | undefined> {
+    return this.initializeRequests.get(sessionId);
   }
 
   /**

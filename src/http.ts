@@ -4,7 +4,7 @@ import { RESPONSE_ALREADY_SENT } from "@hono/node-server/utils/response";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { v4 as uuidv4 } from "uuid";
@@ -57,9 +57,9 @@ export interface HttpServerSessionOptions {
    * Called for cleanup paths: TTL expiration, DELETE requests, transport close, and server shutdown.
    * Useful for cleaning up session-scoped resources like database connections or client state.
    *
-   * Note: Event stores are NOT cleared on server shutdown to allow persistent stores
-   * (Redis, DB) to retain events for resumability across restarts. Event stores are only
-   * cleared when sessions are explicitly deleted or expired via TTL.
+   * Note: Event stores are only cleared on explicit DELETE requests to allow session restoration
+   * from persistent stores (Redis, DB) after server restarts or TTL expiration. If you need to
+   * clean up old event store data, implement a retention policy in your EventStore implementation.
    *
    * In TTL cleanup, the callback is invoked but not awaited to avoid blocking the cleanup interval.
    * In all other paths (DELETE, transport close, shutdown), async callbacks are awaited.
@@ -85,6 +85,20 @@ export interface HttpServerSessionOptions {
    * @deprecated SSE transport is deprecated in favor of Streamable HTTP.
    */
   legacySse?: LegacySseOptions;
+  /**
+   * Callback invoked after a session has been restored from persistent storage.
+   * This is called AFTER the initialized notification has been sent and processed,
+   * allowing the server's oninitialized callback to complete.
+   *
+   * Use this to wait for any async initialization that happens in your server's
+   * oninitialized callback (e.g., connecting upstream servers, loading resources).
+   *
+   * The restoration will not complete until this callback resolves.
+   *
+   * @param sessionId - The ID of the restored session
+   * @param server - The restored McpServer instance
+   */
+  onSessionRestored?: (sessionId: string, server: McpServer) => Promise<void>;
 }
 
 /**
@@ -271,8 +285,10 @@ function serveHttpStateful(
   options: HttpServerStatefulOptions,
 ): ServerHandle {
   const sessions = new Map<string, SessionState>();
+  const restorationInProgress = new Map<string, Promise<SessionState | undefined>>();
   const sessionIdGenerator = options.sessions.sessionIdGenerator ?? uuidv4;
   const onSessionClosed = options.sessions.onSessionClosed;
+  const onSessionRestored = options.sessions.onSessionRestored;
 
   // Default event store factory creates in-memory instances
   const eventStoreFactory: EventStoreFactory =
@@ -316,6 +332,120 @@ function serveHttpStateful(
     }
   };
 
+  /**
+   * Attempt to restore a session from persistent storage.
+   * Only supported for Streamable HTTP sessions with event stores that implement
+   * the restoration methods (hasSession, getInitializeRequest).
+   *
+   * @param sessionId - The ID of the session to restore
+   * @returns The restored session state, or undefined if restoration is not possible
+   */
+  const restoreSession = async (
+    sessionId: string,
+  ): Promise<SessionState | undefined> => {
+    const eventStore = await eventStoreFactory(sessionId);
+
+    // Check if restoration is supported and session exists in the event store
+    if (!eventStore.hasSession || !eventStore.getInitializeRequest) {
+      return undefined;
+    }
+
+    const hasData = await eventStore.hasSession(sessionId);
+    if (!hasData) {
+      return undefined;
+    }
+
+    const initRequest = await eventStore.getInitializeRequest(sessionId);
+    if (!initRequest) {
+      return undefined;
+    }
+
+    // Recreate server and transport
+    const server = await serverFactory(sessionId);
+    let sessionState: StreamableHttpSessionState | undefined;
+
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+      eventStore,
+      onsessioninitialized: () => {
+        sessionState = {
+          type: "streamable-http",
+          transport,
+          server,
+          eventStore,
+          lastActivity: Date.now(),
+          activeStreams: 0,
+        };
+        sessions.set(sessionId, sessionState);
+      },
+    });
+
+    await server.connect(transport);
+
+    transport.onclose = () => {
+      // Don't clear event store on transport close - preserve data for potential
+      // session restoration. Event stores are only cleared on explicit DELETE.
+      sessions.delete(sessionId);
+      notifySessionClosed(sessionId);
+    };
+
+    // Create mock request to replay initialization
+    const mockInitRequest = new Request("http://localhost/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify(initRequest),
+    });
+
+    // Process init request to restore session state
+    // Must consume response body to complete the request cycle
+    const initResponse = await transport.handleRequest(mockInitRequest);
+    if (initResponse.body) {
+      // Consume the response body (may be SSE stream)
+      const reader = initResponse.body.getReader();
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    }
+
+    // Send the "initialized" notification to complete the initialization flow
+    // This triggers the server's oninitialized callback which may initialize
+    // upstream connections or other session-scoped resources
+    const mockInitializedNotification = new Request("http://localhost/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+        params: {},
+      }),
+    });
+
+    const notifResponse = await transport.handleRequest(mockInitializedNotification);
+    if (notifResponse.body) {
+      const reader = notifResponse.body.getReader();
+      while (true) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    }
+
+    // Wait for full initialization if callback provided
+    // This allows the server's oninitialized callback to complete before returning
+    if (onSessionRestored) {
+      await onSessionRestored(sessionId, server);
+    }
+
+    return sessionState;
+  };
+
   // Session TTL configuration
   const sessionTtlMs = options.sessions.sessionTtlMs;
   const cleanupIntervalMs = options.sessions.cleanupIntervalMs ?? 60000; // Default 1 minute
@@ -331,14 +461,12 @@ function serveHttpStateful(
           continue;
         }
         if (now - session.lastActivity > sessionTtlMs) {
-          // Session expired - close transport and remove
+          // Session expired - close transport and remove from memory
+          // Note: We do NOT clear the event store here to allow session restoration
+          // if the client reconnects. Event stores are only cleared on explicit DELETE.
           session.transport.close().catch(() => {
             // Ignore close errors for expired sessions
           });
-          // Clear event store if this is a streamable HTTP session
-          if (session.type === "streamable-http") {
-            session.eventStore.clear();
-          }
           sessions.delete(sessionId);
           // Notify callback (fire and forget to avoid blocking interval)
           notifySessionClosed(sessionId);
@@ -408,6 +536,13 @@ function serveHttpStateful(
 
       // Call event store factory with session ID (supports async factories)
       const eventStore = await eventStoreFactory(sid);
+
+      // Store the initialize request for potential session restoration
+      if (eventStore.storeInitializeRequest) {
+        // Cast through unknown because isInitializeRequest narrows to a type without jsonrpc
+        await eventStore.storeInitializeRequest(sid, body as unknown as JSONRPCMessage);
+      }
+
       const transport = new WebStandardStreamableHTTPServerTransport({
         // Use our pre-generated session ID
         sessionIdGenerator: () => sid,
@@ -430,7 +565,8 @@ function serveHttpStateful(
       await server.connect(transport);
 
       transport.onclose = () => {
-        eventStore.clear();
+        // Don't clear event store on transport close - preserve data for potential
+        // session restoration. Event stores are only cleared on explicit DELETE.
         sessions.delete(sid);
         // Notify callback (fire and forget since onclose is sync)
         notifySessionClosed(sid);
@@ -441,10 +577,29 @@ function serveHttpStateful(
 
     // Existing session
     if (sessionId) {
-      const session = sessions.get(sessionId);
+      let session = sessions.get(sessionId);
+
+      // Attempt restoration if session not in memory
+      if (!session) {
+        // Use restoration lock to prevent concurrent restoration attempts
+        let restorationPromise = restorationInProgress.get(sessionId);
+
+        if (!restorationPromise) {
+          restorationPromise = restoreSession(sessionId);
+          restorationInProgress.set(sessionId, restorationPromise);
+        }
+
+        try {
+          session = await restorationPromise;
+        } finally {
+          restorationInProgress.delete(sessionId);
+        }
+      }
+
       if (!session) {
         return c.text("Session not found", 404);
       }
+
       // Validate transport type matches endpoint
       if (session.type !== "streamable-http") {
         return c.json(
@@ -569,8 +724,8 @@ function serveHttpStateful(
         clearInterval(cleanupInterval);
       }
       // Close all active sessions
-      // Note: We do NOT clear event stores on shutdown to allow persistent
-      // stores (Redis, DB) to retain events for resumability across restarts
+      // Event stores are NOT cleared - only explicit DELETE clears them
+      // This allows session restoration after server restart
       for (const [sessionId, session] of sessions) {
         await session.transport.close().catch(() => {
           // Ignore close errors during shutdown

@@ -982,4 +982,243 @@ describe("serveHttp integration tests", () => {
       await client.close();
     });
   });
+
+  describe("session restoration", () => {
+    it("restores session from persistent event store after simulated restart", async () => {
+      // Use a persistent store that survives clear() calls
+      // This simulates a DB-backed store that persists init requests
+      class PersistentTestStore extends InMemoryEventStore {
+        private persistedInitRequest: { sessionId: string; request: unknown } | undefined;
+
+        override async storeInitializeRequest(sessionId: string, request: unknown): Promise<void> {
+          this.persistedInitRequest = { sessionId, request };
+          await super.storeInitializeRequest(sessionId, request as import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage);
+        }
+
+        override async hasSession(sessionId: string): Promise<boolean> {
+          return this.persistedInitRequest?.sessionId === sessionId;
+        }
+
+        override async getInitializeRequest(sessionId: string): Promise<import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage | undefined> {
+          if (this.persistedInitRequest?.sessionId === sessionId) {
+            return this.persistedInitRequest.request as import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage;
+          }
+          return undefined;
+        }
+
+        // Override clear to NOT clear the init request (simulating persistent storage)
+        override clear(): void {
+          // Only clear events, not the init request
+          // This simulates a DB store that persists init requests
+        }
+      }
+
+      const sharedStore = new PersistentTestStore();
+      let capturedSessionId: string | undefined;
+
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          eventStoreFactory: () => sharedStore,
+          sessionIdGenerator: () => {
+            capturedSessionId = "restoration-test-session-" + Date.now();
+            return capturedSessionId;
+          },
+        },
+      });
+
+      // Create initial session and make a request
+      const client = await createClient(baseUrl);
+      const result = (await client.callTool({
+        name: "echo",
+        arguments: { message: "before restart" },
+      })) as CallToolResult;
+      expect(result.content[0]).toMatchObject({
+        text: "Echo: before restart",
+      });
+
+      // Close the client before shutting down
+      await client.close();
+
+      // Simulate server restart by closing and reopening
+      await serverHandle.close();
+      serverHandle = undefined;
+
+      // Get a new port to avoid port conflicts
+      const newPort = await getPort();
+      const newBaseUrl = `http://127.0.0.1:${newPort}/mcp`;
+
+      // Reopen server with the same shared store
+      serverHandle = await serveHttp(createTestServer, {
+        port: newPort,
+        sessions: {
+          eventStoreFactory: () => sharedStore,
+        },
+      });
+
+      // Try to use the old session ID - should restore successfully
+      const response = await fetch(newBaseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          "mcp-session-id": capturedSessionId!,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "tools/list",
+          id: 1,
+        }),
+      });
+
+      // Should succeed (200 OK) instead of 404
+      expect(response.status).toBe(200);
+
+      // Response might be SSE format or JSON - handle both
+      const contentType = response.headers.get("content-type");
+      let responseBody: unknown;
+      if (contentType?.includes("text/event-stream")) {
+        // Parse SSE format: "event: message\ndata: {...}\n\n"
+        const sseText = await response.text();
+        const dataLine = sseText.split("\n").find(line => line.startsWith("data: "));
+        responseBody = dataLine ? JSON.parse(dataLine.slice(6)) : null;
+      } else {
+        responseBody = await response.json();
+      }
+
+      expect(responseBody).toMatchObject({
+        jsonrpc: "2.0",
+        result: {
+          tools: expect.arrayContaining([
+            expect.objectContaining({ name: "echo" }),
+          ]),
+        },
+        id: 1,
+      });
+    });
+
+    it("returns 404 for unknown session when event store has no data", async () => {
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          // Empty event stores that support restoration methods but have no data
+          eventStoreFactory: () => new InMemoryEventStore(),
+        },
+      });
+
+      // Try to use a non-existent session ID
+      const response = await fetch(baseUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "mcp-session-id": "non-existent-session-12345",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          method: "tools/list",
+          id: 1,
+        }),
+      });
+
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe("Session not found");
+    });
+
+    it("handles concurrent restoration requests for same session", async () => {
+      // Use a persistent store that survives clear() calls
+      class PersistentTestStore extends InMemoryEventStore {
+        private persistedInitRequest: { sessionId: string; request: unknown } | undefined;
+
+        override async storeInitializeRequest(sessionId: string, request: unknown): Promise<void> {
+          this.persistedInitRequest = { sessionId, request };
+          await super.storeInitializeRequest(sessionId, request as import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage);
+        }
+
+        override async hasSession(sessionId: string): Promise<boolean> {
+          return this.persistedInitRequest?.sessionId === sessionId;
+        }
+
+        override async getInitializeRequest(sessionId: string): Promise<import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage | undefined> {
+          if (this.persistedInitRequest?.sessionId === sessionId) {
+            return this.persistedInitRequest.request as import("@modelcontextprotocol/sdk/types.js").JSONRPCMessage;
+          }
+          return undefined;
+        }
+
+        override clear(): void {
+          // Only clear events, not the init request
+        }
+      }
+
+      const sharedStore = new PersistentTestStore();
+      let restorationAttempts = 0;
+      const restorationDelay = 100; // ms
+
+      // First, create a session
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          eventStoreFactory: () => sharedStore,
+          sessionIdGenerator: () => "concurrent-test-session",
+        },
+      });
+
+      // Initialize the session
+      const client = await createClient(baseUrl);
+      await client.listTools();
+      await client.close();
+
+      // Simulate restart
+      await serverHandle.close();
+      serverHandle = undefined;
+
+      // Get a new port
+      const newPort = await getPort();
+      const newBaseUrl = `http://127.0.0.1:${newPort}/mcp`;
+
+      // Reopen with a slow event store factory to simulate slow restoration
+      serverHandle = await serveHttp(createTestServer, {
+        port: newPort,
+        sessions: {
+          eventStoreFactory: async () => {
+            restorationAttempts++;
+            // Add delay to simulate slow restoration
+            await new Promise((resolve) => setTimeout(resolve, restorationDelay));
+            return sharedStore;
+          },
+        },
+      });
+
+      // Fire multiple concurrent requests with the same session ID
+      const concurrentRequests = Array(3)
+        .fill(null)
+        .map(() =>
+          fetch(newBaseUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+              "mcp-session-id": "concurrent-test-session",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              method: "tools/list",
+              id: 1,
+            }),
+          }),
+        );
+
+      const responses = await Promise.all(concurrentRequests);
+
+      // All requests should succeed
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+      }
+
+      // Only ONE restoration should have been attempted due to the lock
+      // (eventStoreFactory is called once for restoration check, then the
+      // restored session is reused for subsequent requests)
+      expect(restorationAttempts).toBe(1);
+    });
+  });
 });
