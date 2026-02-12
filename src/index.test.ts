@@ -6,6 +6,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import getPort from "get-port";
 import { z } from "zod";
+import { InMemoryEventStore } from "./event-store.js";
 import { serveHttp, type ServerHandle } from "./index.js";
 
 /**
@@ -833,6 +834,152 @@ describe("serveHttp integration tests", () => {
       });
 
       expect(postResponse.status).toBe(404);
+    });
+  });
+
+  describe("custom event store factory", () => {
+    it("uses default InMemoryEventStore when factory not provided", async () => {
+      // Verify backward compatibility - existing code works unchanged
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          sessionTtlMs: 60000,
+          // No eventStoreFactory provided
+        },
+      });
+
+      const client = await createClient(baseUrl);
+
+      // Verify session works (implicitly using default InMemoryEventStore)
+      const result = (await client.callTool({
+        name: "echo",
+        arguments: { message: "test" },
+      })) as CallToolResult;
+      expect(result.content[0]).toMatchObject({
+        type: "text",
+        text: "Echo: test",
+      });
+
+      await client.close();
+    });
+
+    it("calls custom sync factory with correct session ID", async () => {
+      // Verify factory receives session ID for session-specific configuration
+      const factoryCalls: string[] = [];
+
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          eventStoreFactory: (sessionId) => {
+            factoryCalls.push(sessionId);
+            return new InMemoryEventStore({
+              maxEventsPerStream: 100,
+            });
+          },
+        },
+      });
+
+      const client = await createClient(baseUrl);
+
+      // Verify factory was called exactly once with a valid session ID
+      expect(factoryCalls).toHaveLength(1);
+      expect(factoryCalls[0]).toBeTruthy();
+      expect(typeof factoryCalls[0]).toBe("string");
+
+      await client.close();
+    });
+
+    it("calls custom async factory and awaits result", async () => {
+      // Verify async factory support (important for Redis/DB-backed stores)
+      let factoryCalled = false;
+
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          eventStoreFactory: async (sessionId) => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            factoryCalled = true;
+            return new InMemoryEventStore();
+          },
+        },
+      });
+
+      const client = await createClient(baseUrl);
+
+      // Verify async factory was awaited before session creation completed
+      expect(factoryCalled).toBe(true);
+
+      await client.close();
+    });
+
+    it("creates separate event store instances per session", async () => {
+      // Verify session isolation - each session gets its own store
+      const factoryCalls: string[] = [];
+      const stores: unknown[] = [];
+
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          eventStoreFactory: (sessionId) => {
+            factoryCalls.push(sessionId);
+            const store = new InMemoryEventStore();
+            stores.push(store);
+            return store;
+          },
+        },
+      });
+
+      // Create two separate client sessions
+      const client1 = await createClient(baseUrl);
+      const client2 = await createClient(baseUrl);
+
+      // Verify factory called twice with different session IDs
+      expect(factoryCalls).toHaveLength(2);
+      expect(factoryCalls[0]).not.toBe(factoryCalls[1]);
+
+      // Verify two separate store instances created
+      expect(stores).toHaveLength(2);
+      expect(stores[0]).not.toBe(stores[1]);
+
+      await client1.close();
+      await client2.close();
+    });
+
+    it("respects InMemoryEventStore options from factory", async () => {
+      // Verify factory can pass custom options to InMemoryEventStore
+      serverHandle = await serveHttp(createTestServer, {
+        port,
+        sessions: {
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          eventStoreFactory: (sessionId) => {
+            // Create with maxEventsPerStream limit
+            return new InMemoryEventStore({ maxEventsPerStream: 5 });
+          },
+        },
+      });
+
+      const client = await createClient(baseUrl);
+
+      // Make multiple requests to generate events
+      for (let i = 0; i < 10; i++) {
+        await client.callTool({
+          name: "echo",
+          arguments: { message: `test ${i}` },
+        });
+      }
+
+      // Session still works (no errors thrown)
+      const result = (await client.callTool({
+        name: "echo",
+        arguments: { message: "final test" },
+      })) as CallToolResult;
+      expect(result.content[0]).toMatchObject({
+        type: "text",
+        text: "Echo: final test",
+      });
+
+      await client.close();
     });
   });
 });

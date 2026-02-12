@@ -134,6 +134,43 @@ const handle = await serveHttp(createServer, {
 });
 ```
 
+#### Custom Event Store Factory
+
+By default, sessions use an in-memory event store that loses events on server restart. You can provide a custom event store factory for persistent storage:
+
+```ts
+import { serveHttp, InMemoryEventStore } from "@karashiiro/mcp/http";
+
+const handle = await serveHttp(
+  (sessionId) => createServer(),
+  {
+    port: 8080,
+    sessions: {
+      // Custom factory with options
+      eventStoreFactory: (sessionId) => {
+        return new InMemoryEventStore({
+          maxEventsPerStream: 1000, // Limit events per stream
+        });
+      },
+    },
+  },
+);
+```
+
+The factory can be async for implementations requiring initialization:
+
+```ts
+sessions: {
+  eventStoreFactory: async (sessionId) => {
+    // Example: Redis-backed event store
+    const store = await createRedisEventStore(sessionId);
+    return store;
+  },
+}
+```
+
+Custom event stores must implement the `EventStore` interface from `@karashiiro/mcp/http`, which includes the `clear()` method for cleanup.
+
 #### Legacy SSE Support
 
 For backwards compatibility with older MCP clients that use SSE transport:

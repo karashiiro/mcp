@@ -10,12 +10,16 @@ import { cors } from "hono/cors";
 import { v4 as uuidv4 } from "uuid";
 import { InMemoryEventStore } from "./event-store.js";
 import type {
+  EventStore,
+  EventStoreFactory,
   ServerHandle,
   StatelessServerFactory,
   StatefulServerFactory,
 } from "./types.js";
 
 export type {
+  EventStore,
+  EventStoreFactory,
   ServerHandle,
   StatelessServerFactory,
   StatefulServerFactory,
@@ -50,15 +54,31 @@ export interface HttpServerSessionOptions {
   cleanupIntervalMs?: number;
   /**
    * Callback invoked when a session is closed.
-   * Called for all cleanup paths: TTL expiration, DELETE requests, transport close, and server shutdown.
+   * Called for cleanup paths: TTL expiration, DELETE requests, transport close, and server shutdown.
    * Useful for cleaning up session-scoped resources like database connections or client state.
    *
-   * Note: In TTL cleanup, the callback is invoked but not awaited to avoid blocking the cleanup interval.
+   * Note: Event stores are NOT cleared on server shutdown to allow persistent stores
+   * (Redis, DB) to retain events for resumability across restarts. Event stores are only
+   * cleared when sessions are explicitly deleted or expired via TTL.
+   *
+   * In TTL cleanup, the callback is invoked but not awaited to avoid blocking the cleanup interval.
    * In all other paths (DELETE, transport close, shutdown), async callbacks are awaited.
    *
    * @param sessionId - The ID of the session being closed
    */
   onSessionClosed?: (sessionId: string) => void | Promise<void>;
+  /**
+   * Factory function for creating event stores per session.
+   * Receives the session ID and returns an EventStore implementation.
+   * Defaults to creating InMemoryEventStore instances.
+   *
+   * Use this to provide custom event storage (e.g., Redis-backed) for
+   * persistent resumability across server restarts.
+   *
+   * @param sessionId - The ID of the session being created
+   * @returns EventStore instance (sync or async)
+   */
+  eventStoreFactory?: EventStoreFactory;
   /**
    * Enable legacy SSE transport compatibility.
    * When provided, adds /sse and /messages endpoints for older clients.
@@ -121,7 +141,7 @@ interface SessionStateBase {
 interface StreamableHttpSessionState extends SessionStateBase {
   type: "streamable-http";
   transport: WebStandardStreamableHTTPServerTransport;
-  eventStore: InMemoryEventStore;
+  eventStore: EventStore;
 }
 
 /**
@@ -254,6 +274,10 @@ function serveHttpStateful(
   const sessionIdGenerator = options.sessions.sessionIdGenerator ?? uuidv4;
   const onSessionClosed = options.sessions.onSessionClosed;
 
+  // Default event store factory creates in-memory instances
+  const eventStoreFactory: EventStoreFactory =
+    options.sessions.eventStoreFactory ?? (() => new InMemoryEventStore());
+
   // Helper to safely invoke onSessionClosed callback
   // Catches errors to prevent user code from breaking cleanup
   const notifySessionClosed = (sessionId: string): void => {
@@ -382,7 +406,8 @@ function serveHttpStateful(
       // Create server with session ID (supports async factories)
       const server = await serverFactory(sid);
 
-      const eventStore = new InMemoryEventStore();
+      // Call event store factory with session ID (supports async factories)
+      const eventStore = await eventStoreFactory(sid);
       const transport = new WebStandardStreamableHTTPServerTransport({
         // Use our pre-generated session ID
         sessionIdGenerator: () => sid,
@@ -543,15 +568,13 @@ function serveHttpStateful(
       if (cleanupInterval) {
         clearInterval(cleanupInterval);
       }
-      // Close all active sessions and clear their event stores
+      // Close all active sessions
+      // Note: We do NOT clear event stores on shutdown to allow persistent
+      // stores (Redis, DB) to retain events for resumability across restarts
       for (const [sessionId, session] of sessions) {
         await session.transport.close().catch(() => {
           // Ignore close errors during shutdown
         });
-        // Clear event store if this is a streamable HTTP session
-        if (session.type === "streamable-http") {
-          session.eventStore.clear();
-        }
         // Notify callback (awaited since we're in async shutdown)
         await notifySessionClosedAsync(sessionId);
       }
